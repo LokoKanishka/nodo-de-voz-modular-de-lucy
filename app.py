@@ -1,33 +1,80 @@
-import time
-import threading
-import numpy as np
-import whisper
-import sounddevice as sd
 import argparse
 import os
+import threading
+import time
 from queue import Queue
-from rich.console import Console
+
+import numpy as np
+import sounddevice as sd
+import whisper
+import yaml
+from langchain_core.chat_history import InMemoryChatMessageHistory
 # Updated imports for modern LangChain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_ollama import OllamaLLM
+from rich.console import Console
+
 from tts import TextToSpeechService
 
 console = Console()
-stt = whisper.load_model("base.en")
 
-# Parse command line arguments
-parser = argparse.ArgumentParser(description="Local Voice Assistant with ChatterBox TTS")
-parser.add_argument("--voice", type=str, help="Path to voice sample for cloning")
+DEFAULT_CONFIG = {
+    "tts": {
+        "engine": "mimic3",
+        "voice": "es_ES/m-ailabs_low",
+        "sample_rate": 16000,
+    },
+    "stt": {
+        "model": "small",
+        "language": "es",
+        "task": "transcribe",
+    },
+    "llm": {
+        "model": "gpt-oss:20b",
+        "base_url": "http://localhost:11434",
+    },
+}
+
+
+def load_config(path: str = "config.yaml") -> dict:
+    if not os.path.exists(path):
+        return DEFAULT_CONFIG
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return DEFAULT_CONFIG
+
+    # merge defaults
+    cfg = DEFAULT_CONFIG.copy()
+    for section, values in data.items():
+        if isinstance(values, dict):
+            cfg.setdefault(section, {}).update(values)
+    return cfg
+
+
+config = load_config()
+
+# Parse command line arguments using config defaults
+parser = argparse.ArgumentParser(description="Local Voice Assistant with Mimic3 TTS (Lucy-style)")
+parser.add_argument("--voice", type=str, default=config["tts"]["voice"], help="Mimic3 voice id (e.g., es_ES/m-ailabs_low)")
+parser.add_argument("--sample-rate", type=int, default=config["tts"]["sample_rate"], help="Output sample rate for TTS/audio playback")
 parser.add_argument("--exaggeration", type=float, default=0.5, help="Emotion exaggeration (0.0-1.0)")
 parser.add_argument("--cfg-weight", type=float, default=0.5, help="CFG weight for pacing (0.0-1.0)")
-parser.add_argument("--model", type=str, default="gemma3", help="Ollama model to use")
+parser.add_argument("--model", type=str, default=config["llm"]["model"], help="Ollama model to use")
 parser.add_argument("--save-voice", action="store_true", help="Save generated voice samples")
+parser.add_argument("--stt-model", type=str, default=config["stt"]["model"], help="Whisper model name (Spanish-capable)")
+parser.add_argument("--stt-language", type=str, default=config["stt"]["language"], help="Target language for Whisper")
+parser.add_argument("--stt-task", type=str, default=config["stt"]["task"], help="Whisper task: transcribe/translate")
 args = parser.parse_args()
 
-# Initialize TTS with ChatterBox
-tts = TextToSpeechService()
+# Initialize TTS with Mimic3 (default Spanish voice)
+tts = TextToSpeechService(voice=args.voice, sample_rate=args.sample_rate)
+
+# Spanish-first model; language enforced during transcribe to keep STT stable.
+stt = whisper.load_model(args.stt_model)
 
 # Modern prompt template using ChatPromptTemplate
 prompt_template = ChatPromptTemplate.from_messages([
@@ -37,7 +84,7 @@ prompt_template = ChatPromptTemplate.from_messages([
 ])
 
 # Initialize LLM
-llm = OllamaLLM(model=args.model, base_url="http://localhost:11434")
+llm = OllamaLLM(model=args.model, base_url=config["llm"].get("base_url", "http://localhost:11434"))
 
 # Create the chain with modern LCEL syntax
 chain = prompt_template | llm
@@ -92,7 +139,12 @@ def transcribe(audio_np: np.ndarray) -> str:
     Returns:
         str: The transcribed text.
     """
-    result = stt.transcribe(audio_np, fp16=False)  # Set fp16=True if using a GPU
+    result = stt.transcribe(
+        audio_np,
+        fp16=False,  # Set fp16=True if using a GPU
+        language=args.stt_language,
+        task=args.stt_task,
+    )
     text = result["text"].strip()
     return text
 
@@ -156,13 +208,11 @@ def analyze_emotion(text: str) -> float:
 
 
 if __name__ == "__main__":
-    console.print("[cyan]🤖 Local Voice Assistant with ChatterBox TTS")
+    console.print("[cyan]🤖 Local Voice Assistant with Mimic3 TTS")
     console.print("[cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     if args.voice:
-        console.print(f"[green]Using voice cloning from: {args.voice}")
-    else:
-        console.print("[yellow]Using default voice (no cloning)")
+        console.print(f"[green]Using Mimic3 voice: {args.voice}")
 
     console.print(f"[blue]Emotion exaggeration: {args.exaggeration}")
     console.print(f"[blue]CFG weight: {args.cfg_weight}")

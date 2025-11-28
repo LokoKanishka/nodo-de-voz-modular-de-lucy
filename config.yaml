@@ -1,0 +1,15 @@
+# Default configuration for lucy_talking_llm
+
+tts:
+  engine: mimic3
+  voice: es_ES/m-ailabs_low
+  sample_rate: 16000
+
+stt:
+  model: small
+  language: es
+  task: transcribe
+
+llm:
+  model: gpt-oss:20b
+  base_url: http://localhost:11434

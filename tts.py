@@ -1,95 +1,121 @@
-import nltk
-import torch
-import warnings
-import numpy as np
-import torchaudio as ta
-from chatterbox.tts import ChatterboxTTS
+"""
+Text-to-Speech service using Mimic3.
+Replacement for ChatterBox TTS to work with Python 3.12.
 
-warnings.filterwarnings(
-    "ignore",
-    message="torch.nn.utils.weight_norm is deprecated in favor of torch.nn.utils.parametrizations.weight_norm.",
-)
+Lucy: reemplazamos chatterbox-tts por Mimic3TTS para mantener todo local y
+compatible con Python 3.12 y alineado con Proyecto-VSCode.
+"""
+import io
+import subprocess
+from typing import Tuple, Optional
+
+import nltk
+import numpy as np
+import soundfile as sf
 
 
 class TextToSpeechService:
-    def __init__(self, device: str | None = None):
+    """
+    Implementación simple de TTS que llama al binario `mimic3`
+    y devuelve (sample_rate, numpy_array) como espera app.py.
+    """
+
+    def __init__(
+        self,
+        voice: str = "es_ES/m-ailabs_low",
+        sample_rate: int = 16000,
+        device: Optional[str] = None,
+    ):
         """
-        Initializes the TextToSpeechService class with ChatterBox TTS.
+        Initializes the TextToSpeechService class with Mimic3 TTS.
 
         Args:
-            device (str, optional): The device to be used for the model. If None, will auto-detect.
-                Can be "cuda", "mps", or "cpu".
+            voice (str): The Mimic3 voice to use. Defaults to Spanish.
+            device (str, optional): Ignored for compatibility with original interface.
         """
-        if device is None:
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            elif torch.backends.mps.is_available():
-                self.device = "mps"
-            else:
-                self.device = "cpu"
-        else:
-            self.device = device
+        self.voice = voice
+        self.sample_rate = sample_rate
+        self._mimic3_sample_rate = 22050  # default mimic3 output
+        print(f"Using Mimic3 TTS with voice: {self.voice} @ {self.sample_rate}Hz")
 
-        print(f"Using device: {self.device}")
-
-        if self.device == "cuda" and not torch.cuda.is_available():
-            print("CUDA requested but not available, falling back to CPU")
-            self.device = "cpu"
-
-        self._patch_torch_load()
-        self.model = ChatterboxTTS.from_pretrained(device=self.device)
-        self.sample_rate = self.model.sr
-
-    def _patch_torch_load(self):
+    def synthesize(
+        self,
+        text: str,
+        audio_prompt_path: str | None = None,
+        exaggeration: float = 0.5,
+        cfg_weight: float = 0.5,
+    ) -> Tuple[int, np.ndarray]:
         """
-        Patches torch.load to automatically map tensors to the correct device.
-        This is needed because ChatterBox models may have been saved on CUDA.
-        """
-        map_location = torch.device(self.device)
-
-        if not hasattr(torch, '_original_load'):
-            torch._original_load = torch.load
-
-        def patched_torch_load(*args, **kwargs):
-            if 'map_location' not in kwargs:
-                kwargs['map_location'] = map_location
-            return torch._original_load(*args, **kwargs)
-
-        torch.load = patched_torch_load
-
-    def synthesize(self, text: str, audio_prompt_path: str | None = None, exaggeration: float = 0.5, cfg_weight: float = 0.5):
-        """
-        Synthesizes audio from the given text using ChatterBox TTS.
+        Synthesizes audio from the given text using Mimic3 TTS.
 
         Args:
             text (str): The input text to be synthesized.
-            audio_prompt_path (str, optional): Path to audio file for voice cloning. Defaults to None.
-            exaggeration (float, optional): Emotion exaggeration control (0-1). Defaults to 0.5.
-            cfg_weight (float, optional): Control for pacing and delivery. Defaults to 0.5.
+            audio_prompt_path (str, optional): Ignored (kept for compatibility).
+            exaggeration (float, optional): Ignored (kept for compatibility).
+            cfg_weight (float, optional): Ignored (kept for compatibility).
 
         Returns:
             tuple: A tuple containing the sample rate and the generated audio array.
         """
-        wav = self.model.generate(
-            text,
-            audio_prompt_path=audio_prompt_path,
-            exaggeration=exaggeration,
-            cfg_weight=cfg_weight
-        )
+        # Call mimic3 by CLI and capture the WAV output
+        cmd = ["mimic3", "--voice", self.voice, "--stdout"]
 
-        # Convert tensor to numpy array format compatible with sounddevice
-        audio_array = wav.squeeze().cpu().numpy()
-        return self.sample_rate, audio_array
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                input=text.encode("utf-8"),
+                check=True,
+            )
+            wav_bytes = proc.stdout
+        except subprocess.CalledProcessError as e:
+            print(f"Error calling mimic3: {e} | stderr={e.stderr.decode(errors='ignore')}")
+            # Return silence on error
+            return self.sample_rate, np.zeros(self.sample_rate)
+        except FileNotFoundError:
+            print("Error: mimic3 command not found. Please install Mimic3.")
+            return self.sample_rate, np.zeros(self.sample_rate)
 
-    def long_form_synthesize(self, text: str, audio_prompt_path: str | None = None, exaggeration: float = 0.5, cfg_weight: float = 0.5):
+        # Convert WAV bytes -> (float32 array, sample_rate)
+        try:
+            audio, sample_rate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+        except Exception as e:
+            print(f"Error reading audio from mimic3: {e}")
+            return self.sample_rate, np.zeros(self.sample_rate)
+
+        # Convert stereo to mono if needed
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+
+        # Resample to target sample_rate if needed so downstream playback is consistent.
+        if sample_rate != self.sample_rate:
+            duration = len(audio) / sample_rate
+            target_len = int(duration * self.sample_rate)
+            audio = np.interp(
+                np.linspace(0, len(audio) - 1, num=target_len),
+                np.arange(len(audio)),
+                audio,
+            ).astype(np.float32)
+            sample_rate = self.sample_rate
+
+        return sample_rate, audio
+
+    def long_form_synthesize(
+        self,
+        text: str,
+        audio_prompt_path: str | None = None,
+        exaggeration: float = 0.5,
+        cfg_weight: float = 0.5,
+    ) -> Tuple[int, np.ndarray]:
         """
-        Synthesizes audio from the given long-form text using ChatterBox TTS.
+        Synthesizes audio from the given long-form text using Mimic3 TTS.
 
         Args:
             text (str): The input text to be synthesized.
-            audio_prompt_path (str, optional): Path to audio file for voice cloning. Defaults to None.
-            exaggeration (float, optional): Emotion exaggeration control (0-1). Defaults to 0.5.
-            cfg_weight (float, optional): Control for pacing and delivery. Defaults to 0.5.
+            audio_prompt_path (str, optional): Ignored (kept for compatibility).
+            exaggeration (float, optional): Ignored (kept for compatibility).
+            cfg_weight (float, optional): Ignored (kept for compatibility).
 
         Returns:
             tuple: A tuple containing the sample rate and the generated audio array.
@@ -103,20 +129,22 @@ class TextToSpeechService:
                 sent,
                 audio_prompt_path=audio_prompt_path,
                 exaggeration=exaggeration,
-                cfg_weight=cfg_weight
+                cfg_weight=cfg_weight,
             )
             pieces += [audio_array, silence.copy()]
 
         return self.sample_rate, np.concatenate(pieces)
 
-    def save_voice_sample(self, text: str, output_path: str, audio_prompt_path: str | None = None):
+    def save_voice_sample(
+        self, text: str, output_path: str, audio_prompt_path: str | None = None
+    ):
         """
         Saves a voice sample to file for later use as voice prompt.
 
         Args:
             text (str): The text to synthesize.
             output_path (str): Path where to save the audio file.
-            audio_prompt_path (str, optional): Path to audio file for voice cloning.
+            audio_prompt_path (str, optional): Ignored (kept for compatibility).
         """
-        wav = self.model.generate(text, audio_prompt_path=audio_prompt_path)
-        ta.save(output_path, wav, self.sample_rate)
+        sample_rate, audio = self.synthesize(text)
+        sf.write(output_path, audio, sample_rate)

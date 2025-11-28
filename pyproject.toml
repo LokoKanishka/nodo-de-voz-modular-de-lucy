@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "chatterbox-tts>=0.1.1",
+    "mimic3-tts>=0.3.0",
     "langchain-ollama>=0.3.3",
     "langchain>=0.3.25",
     "nltk>=3.9.1",
@@ -14,6 +14,7 @@ dependencies = [
     "rich>=14.0.0",
     "setuptools>=80.9.0",
     "sounddevice>=0.5.2",
+    "soundfile>=0.13.1",
     "torchaudio>=2.6.0",
 ]
 
