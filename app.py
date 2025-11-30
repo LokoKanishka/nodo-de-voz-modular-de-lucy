@@ -324,6 +324,21 @@ def analyze_emotion(text: str) -> float:
     return min(0.9, max(0.3, emotion_score))
 
 
+def is_sleep_command(text: str) -> bool:
+    """
+    Devuelve True si el usuario pidió que Lucy 'duerma' (e.g., 'lucy dormi' o 'lucy dormí').
+    """
+    if not text:
+        return False
+
+    normalized = text.strip().lower()
+    for ch in ["¡", "!", "¿", "?", ".", ","]:
+        normalized = normalized.replace(ch, " ")
+
+    normalized = " ".join(normalized.split())
+    return "lucy dormi" in normalized or "lucy dormí" in normalized
+
+
 if __name__ == "__main__":
     console.print("[cyan]🤖 Local Voice Assistant with Mimic3 TTS")
     console.print("[cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -365,6 +380,10 @@ if __name__ == "__main__":
                     continue
 
                 console.print(f"[yellow]You: {text}")
+
+                if is_sleep_command(text):
+                    console.print("[cyan][Lucy] Recibí la orden 'lucy dormi'. Me voy a dormir y cierro la sesión.[/cyan]")
+                    break
 
                 with console.status("Generating response...", spinner="dots"):
                     response = get_llm_response(text)
