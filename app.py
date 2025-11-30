@@ -225,12 +225,14 @@ if __name__ == "__main__":
         os.makedirs("voices", exist_ok=True)
 
     response_count = 0
+    record_duration = 8  # seconds per capture to keep the flow hands-free
+
+    console.print("🎤 Presioná Enter una vez para empezar a hablar (Ctrl+C para salir).")
+    console.input("")  # Single prompt to kick off the session
 
     try:
         while True:
-            console.input(
-                "🎤 Press Enter to start recording, then press Enter again to stop."
-            )
+            console.print("[cyan]Escuchando...[/cyan]")
 
             data_queue = Queue()  # type: ignore[var-annotated]
             stop_event = threading.Event()
@@ -240,7 +242,7 @@ if __name__ == "__main__":
             )
             recording_thread.start()
 
-            input()
+            time.sleep(record_duration)
             stop_event.set()
             recording_thread.join()
 
@@ -252,6 +254,11 @@ if __name__ == "__main__":
             if audio_np.size > 0:
                 with console.status("Transcribing...", spinner="dots"):
                     text = transcribe(audio_np)
+
+                if not text:
+                    console.print("[red]Silencio detectado. Escuchando nuevamente...[/red]")
+                    continue
+
                 console.print(f"[yellow]You: {text}")
 
                 with console.status("Generating response...", spinner="dots"):
@@ -287,6 +294,6 @@ if __name__ == "__main__":
                 )
 
     except KeyboardInterrupt:
-        console.print("\n[red]Exiting...")
+        console.print("\n[red]Saliendo del asistente de voz...")
 
     console.print("[blue]Session ended. Thank you for using ChatterBox Voice Assistant!")
