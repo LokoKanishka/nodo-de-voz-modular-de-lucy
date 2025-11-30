@@ -1,11 +1,11 @@
 import argparse
 import os
 import threading
-import time
 from queue import Queue
 
 import numpy as np
 import sounddevice as sd
+import webrtcvad
 import whisper
 import yaml
 from langchain_core.chat_history import InMemoryChatMessageHistory
@@ -18,6 +18,7 @@ from rich.console import Console
 from tts import TextToSpeechService
 
 console = Console()
+SAMPLE_RATE = 16000  # Hz, used for both VAD and Whisper
 
 DEFAULT_CONFIG = {
     "tts": {
@@ -106,27 +107,143 @@ chain_with_history = RunnableWithMessageHistory(
     history_messages_key="history",
 )
 
-def record_audio(stop_event, data_queue):
+def record_audio(vad: webrtcvad.Vad, max_silence_ms: int = 1000, frame_duration_ms: int = 30) -> np.ndarray:
     """
-    Captures audio data from the user's microphone and adds it to a queue for further processing.
-
-    Args:
-        stop_event (threading.Event): An event that, when set, signals the function to stop recording.
-        data_queue (queue.Queue): A queue to which the recorded audio data will be added.
-
-    Returns:
-        None
+    Records a single utterance using VAD to auto-start and auto-stop on silence.
+    Returns float32 PCM normalized to [-1, 1].
     """
-    def callback(indata, frames, time, status):
+    frame_samples = int(SAMPLE_RATE * frame_duration_ms / 1000)
+    max_silence_frames = max(1, max_silence_ms // frame_duration_ms)
+    data_queue = Queue()  # type: ignore[var-annotated]
+    stop_event = threading.Event()
+
+    def callback(indata, frames, time_info, status):
         if status:
             console.print(status)
         data_queue.put(bytes(indata))
+        if stop_event.is_set():
+            raise sd.CallbackStop()
 
     with sd.RawInputStream(
-        samplerate=16000, dtype="int16", channels=1, callback=callback
+        samplerate=SAMPLE_RATE,
+        dtype="int16",
+        channels=1,
+        blocksize=frame_samples,
+        callback=callback,
     ):
-        while not stop_event.is_set():
-            time.sleep(0.1)
+        frames_bytes = []
+        triggered = False
+        silence_frames = 0
+
+        while True:
+            try:
+                frame = data_queue.get(timeout=1)
+            except Exception:
+                continue
+
+            is_speech = vad.is_speech(frame, SAMPLE_RATE)
+            if is_speech:
+                silence_frames = 0
+                triggered = True
+                frames_bytes.append(frame)
+            elif triggered:
+                silence_frames += 1
+                frames_bytes.append(frame)
+                if silence_frames >= max_silence_frames:
+                    break
+
+        stop_event.set()
+
+    audio_data = b"".join(frames_bytes)
+    if not audio_data:
+        return np.array([], dtype=np.float32)
+
+    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+    return audio_np
+
+
+def record_until_silence(
+    sample_rate: int = SAMPLE_RATE,
+    frame_duration_ms: int = 30,
+    max_silence_ms: int = 1000,
+    max_utterance_ms: int = 15000,
+    device: int | None = None,
+):
+    """
+    Graba desde el micrófono hasta detectar silencio final usando VAD.
+
+    - sample_rate: frecuencia de muestreo (debe ser 16000 Hz para webrtcvad).
+    - frame_duration_ms: tamaño de cada frame de análisis en milisegundos (10, 20 o 30 ms).
+    - max_silence_ms: cuánto silencio seguido se tolera antes de cortar (ej: 1000 ms).
+    - max_utterance_ms: duración máxima dura de un turno, por seguridad (ej: 15000 ms).
+    - device: índice de dispositivo de entrada (None = por defecto).
+
+    Devuelve:
+      - audio_np: np.ndarray float32 1D en rango [-1.0, 1.0], o None si no hubo voz.
+      - sample_rate: la frecuencia de muestreo usada.
+    """
+    vad = webrtcvad.Vad()
+    # Modo de VAD (0 a 3): 0 = muy permisivo, 3 = muy estricto.
+    # Usamos 1 como término medio para no cortar demasiado agresivo.
+    vad.set_mode(1)
+
+    frame_size = int(sample_rate * frame_duration_ms / 1000)  # muestras por frame
+    bytes_per_sample = 2  # int16
+    frame_bytes = frame_size * bytes_per_sample
+
+    max_frames = max_utterance_ms // frame_duration_ms
+    max_silence_frames = max_silence_ms // frame_duration_ms
+
+    voiced_frames: list[bytes] = []
+    triggered = False
+    num_silence_frames = 0
+
+    # RawInputStream nos da bytes int16, que es justo lo que webrtcvad espera.
+    with sd.RawInputStream(
+        samplerate=sample_rate,
+        blocksize=frame_size,
+        channels=1,
+        dtype="int16",
+        device=device,
+    ) as stream:
+        while True:
+            data, overflowed = stream.read(frame_size)
+            if overflowed:
+                continue
+
+            if len(data) < frame_bytes:
+                continue
+
+            is_speech = vad.is_speech(data, sample_rate)
+
+            if not triggered:
+                if is_speech:
+                    triggered = True
+                    voiced_frames.append(data)
+                    num_silence_frames = 0
+                else:
+                    continue
+            else:
+                voiced_frames.append(data)
+
+                if is_speech:
+                    num_silence_frames = 0
+                else:
+                    num_silence_frames += 1
+
+                if num_silence_frames >= max_silence_frames:
+                    break
+
+                if len(voiced_frames) >= max_frames:
+                    break
+
+    if not voiced_frames:
+        return None, sample_rate
+
+    pcm_bytes = b"".join(voiced_frames)
+    audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+    return audio_np, sample_rate
 
 
 def transcribe(audio_np: np.ndarray) -> str:
@@ -225,7 +342,6 @@ if __name__ == "__main__":
         os.makedirs("voices", exist_ok=True)
 
     response_count = 0
-    record_duration = 8  # seconds per capture to keep the flow hands-free
 
     console.print("🎤 Presioná Enter una vez para empezar a hablar (Ctrl+C para salir).")
     console.input("")  # Single prompt to kick off the session
@@ -234,22 +350,11 @@ if __name__ == "__main__":
         while True:
             console.print("[cyan]Escuchando...[/cyan]")
 
-            data_queue = Queue()  # type: ignore[var-annotated]
-            stop_event = threading.Event()
-            recording_thread = threading.Thread(
-                target=record_audio,
-                args=(stop_event, data_queue),
-            )
-            recording_thread.start()
+            audio_np, sr = record_until_silence(sample_rate=SAMPLE_RATE)
 
-            time.sleep(record_duration)
-            stop_event.set()
-            recording_thread.join()
-
-            audio_data = b"".join(list(data_queue.queue))
-            audio_np = (
-                np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            )
+            if audio_np is None:
+                console.print("[red]Solo silencio detectado. Escuchando nuevamente...[/red]")
+                continue
 
             if audio_np.size > 0:
                 with console.status("Transcribing...", spinner="dots"):
@@ -289,9 +394,7 @@ if __name__ == "__main__":
 
                 play_audio(sample_rate, audio_array)
             else:
-                console.print(
-                    "[red]No audio recorded. Please ensure your microphone is working."
-                )
+                console.print("[red]No se detectó voz. Escuchando nuevamente...[/red]")
 
     except KeyboardInterrupt:
         console.print("\n[red]Saliendo del asistente de voz...")
