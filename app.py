@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 import threading
@@ -18,9 +19,11 @@ from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_ollama import OllamaLLM
+from ollama._types import ResponseError
 from rich.console import Console
 
 from tts import TextToSpeechService
+from lucy_agents.desktop_bridge import run_desktop_command
 from lucy_agents.voice_actions import maybe_handle_desktop_intent
 
 console = Console()
@@ -279,32 +282,145 @@ def transcribe(audio_np: np.ndarray) -> str:
     return text
 
 
+def _extract_desktop_tool_json(text: str) -> str | None:
+    """
+    Si el texto del LLM contiene un JSON para la tool 'desktop_agent',
+    devuelve el bloque JSON como string. Si no, devuelve None.
+    """
+    if not text:
+        return None
+
+    t = text.strip()
+
+    if t.startswith("{") and t.endswith("}"):
+        return t
+
+    if t.startswith("```"):
+        first_brace = t.find("{")
+        last_brace = t.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            return t[first_brace : last_brace + 1]
+
+    return None
+
+
+def _handle_desktop_tool_json(json_str: str) -> tuple[bool, str]:
+    """
+    Intenta interpretar un JSON de tool 'desktop_agent' y ejecutar la acción
+    vía Lucy Desktop Agent. Devuelve (handled, texto_para_el_usuario).
+    """
+    try:
+        data = json.loads(json_str)
+    except Exception as e:  # noqa: BLE001
+        print(f"[LucyVoice] No pude parsear JSON de tool: {e}: {json_str!r}")
+        return False, ""
+
+    if not isinstance(data, dict):
+        return False, ""
+
+    if data.get("name") != "desktop_agent":
+        return False, ""
+
+    args = data.get("arguments") or {}
+    command = args.get("command")
+    url = args.get("url")
+
+    if command == "open_url" and isinstance(url, str):
+        if not (url.startswith("http://") or url.startswith("https://")):
+            print(f"[LucyVoice] URL de desktop_agent no segura: {url!r}")
+            return False, ""
+
+        desktop_cmd = f"xdg-open {url}"
+        print(f"[LucyVoice] Ejecutando desktop_agent.open_url -> {desktop_cmd!r}")
+        exit_code = run_desktop_command(desktop_cmd)
+        print(f"[LucyVoice] Resultado desktop_agent.open_url: {exit_code}")
+
+        if exit_code == 0:
+            return True, "Listo, ya lo abrí en tu escritorio."
+        else:
+            return True, (
+                "Intenté abrirlo pero algo falló en el escritorio. "
+                "Revisá si el navegador está instalado y funcionando."
+            )
+
+    print(f"[LucyVoice] Comando desktop_agent no soportado: {command!r}")
+    return False, ""
+
+
 def get_llm_response(text: str) -> str:
     """
-    Generates a response to the given text using the language model.
+    Devuelve el texto final que Lucy le va a decir al usuario.
 
-    Args:
-        text (str): The input text to be processed.
-
-    Returns:
-        str: The generated response.
+    Orden de trabajo:
+      1) Intentar resolver con voice_actions (reglas + Desktop Agent).
+      2) Si no, llamar al LLM (chain_with_history).
+      3) Si el LLM devuelve un JSON de tool 'desktop_agent', ejecutarlo
+         vía Lucy Desktop Agent y devolver un resumen amigable.
+      4) Si el LLM falla o devuelve vacío, usar un fallback seguro.
     """
-    if maybe_handle_desktop_intent(text):
-        # Desktop Agent handled it; keep TTS response short.
-        return "Listo, ya lo abrí en tu escritorio."
+    print(f"[LucyVoice] get_llm_response() input: {text!r}")
 
-    # Use a default session ID for this simple voice assistant
-    session_id = "voice_assistant_session"
+    # 1) Agencia rule-based (sin invocar el LLM).
+    handled = False
+    handled_text = "Listo, ya lo abrí en tu escritorio."
+    try:
+        agency_result = maybe_handle_desktop_intent(text)
+        if isinstance(agency_result, tuple) and len(agency_result) == 2:
+            handled, handled_text = agency_result
+        elif isinstance(agency_result, bool):
+            handled = agency_result
+    except Exception as exc:  # noqa: BLE001
+        print(f"[LucyVoice] Error en voice_actions: {exc!r}")
+        handled = False
 
-    # Invoke the chain with history
-    response = chain_with_history.invoke(
-        {"input": text},
-        config={"session_id": session_id}
-    )
+    if handled:
+        print("[LucyVoice] Resuelto por voice_actions (desktop agent).")
+        print(f"[LucyVoice] get_llm_response() output: {handled_text!r}")
+        return handled_text
 
-    # The response is now a string from the LLM, no need to remove "Assistant:" prefix
-    # since we're using a proper chat model setup
-    return response.strip()
+    # 2) Llamar al LLM con manejo de errores.
+    raw = ""
+    try:
+        session_id = "voice_assistant_session"
+        llm_out = chain_with_history.invoke({"input": text}, config={"session_id": session_id})
+        if isinstance(llm_out, str):
+            raw = llm_out
+        elif hasattr(llm_out, "content"):
+            raw = str(llm_out.content)
+        else:
+            raw = str(llm_out)
+    except ResponseError as e:
+        print(f"[LucyVoice] ResponseError desde Ollama: {e}")
+        raw = ""
+    except Exception as e:  # noqa: BLE001
+        print(f"[LucyVoice] Error llamando al LLM: {e}")
+        raw = ""
+
+    raw = (raw or "").strip()
+    print(f"[LucyVoice] get_llm_response() raw output: {raw!r}")
+
+    # 3) Si parece un JSON de desktop_agent, intentamos ejecutarlo.
+    tool_json = _extract_desktop_tool_json(raw)
+    if tool_json is not None:
+        handled_json, spoken = _handle_desktop_tool_json(tool_json)
+        if handled_json and spoken:
+            print("[LucyVoice] desktop_agent ejecutado a partir de JSON del LLM.")
+            print(f"[LucyVoice] get_llm_response() output: {spoken!r}")
+            return spoken
+
+    # 4) Fallback si no hay texto útil.
+    if not raw:
+        fallback = (
+            "No entendí bien qué querías que haga. "
+            "Probá pedírmelo de nuevo, más despacio o en pasos separados."
+        )
+        print("[LucyVoice] Respuesta vacía del LLM; usando fallback seguro.")
+        print(f"[LucyVoice] get_llm_response() output: {fallback!r}")
+        return fallback
+
+    # 5) Respuesta normal del modelo (texto plano).
+    print(f"[LucyVoice] get_llm_response() output: {raw!r}")
+    return raw
 
 
 def play_audio(sample_rate, audio_array):
