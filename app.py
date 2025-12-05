@@ -30,6 +30,10 @@ from lucy_agents.voice_actions import maybe_handle_desktop_intent
 console = Console()
 SAMPLE_RATE = 16000  # Hz, used for both VAD and Whisper
 
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
 DEFAULT_CONFIG = {
     "tts": {
         "engine": "mimic3",
@@ -349,7 +353,7 @@ def _handle_desktop_tool_json(json_str: str) -> tuple[bool, str]:
     try:
         data = json.loads(json_str)
     except Exception as e:  # noqa: BLE001
-        print(f"[LucyVoice] No pude parsear JSON de tool: {e}: {json_str!r}")
+        _log(f"[LucyVoice] No pude parsear JSON de tool: {e}: {json_str!r}")
         return False, ""
 
     if not isinstance(data, dict):
@@ -362,15 +366,19 @@ def _handle_desktop_tool_json(json_str: str) -> tuple[bool, str]:
     command = args.get("command")
     url = args.get("url")
 
+    # Si falta "command" pero hay URL, asumimos open_url (el modelo a veces omite el campo).
+    if isinstance(url, str) and not command:
+        command = "open_url"
+
     if command == "open_url" and isinstance(url, str):
         if not (url.startswith("http://") or url.startswith("https://")):
-            print(f"[LucyVoice] URL de desktop_agent no segura: {url!r}")
+            _log(f"[LucyVoice] URL de desktop_agent no segura: {url!r}")
             return False, ""
 
         desktop_cmd = f"xdg-open {url}"
-        print(f"[LucyVoice] Ejecutando desktop_agent.open_url -> {desktop_cmd!r}")
+        _log(f"[LucyVoice] Executing desktop_agent.open_url -> {desktop_cmd!r}")
         exit_code = run_desktop_command(desktop_cmd)
-        print(f"[LucyVoice] Resultado desktop_agent.open_url: {exit_code}")
+        _log(f"[LucyVoice] desktop_agent.open_url exit_code: {exit_code}")
 
         if exit_code == 0:
             return True, "Listo, ya lo abrí en tu escritorio."
@@ -380,7 +388,7 @@ def _handle_desktop_tool_json(json_str: str) -> tuple[bool, str]:
                 "Revisá si el navegador está instalado y funcionando."
             )
 
-    print(f"[LucyVoice] Comando desktop_agent no soportado: {command!r}")
+    _log(f"[LucyVoice] Comando desktop_agent no soportado: {command!r}")
     return False, ""
 
 
@@ -395,7 +403,7 @@ def get_llm_response(text: str) -> str:
          vía Lucy Desktop Agent y devolver un resumen amigable.
       4) Si el LLM falla o devuelve vacío, usar un fallback seguro.
     """
-    print(f"[LucyVoice] get_llm_response() input: {text!r}")
+    _log(f"[LucyVoice] get_llm_response() input: {text!r}")
 
     # 1) Agencia rule-based (sin invocar el LLM).
     handled = False
@@ -407,12 +415,12 @@ def get_llm_response(text: str) -> str:
         elif isinstance(agency_result, bool):
             handled = agency_result
     except Exception as exc:  # noqa: BLE001
-        print(f"[LucyVoice] Error en voice_actions: {exc!r}")
+        _log(f"[LucyVoice] Error en voice_actions: {exc!r}")
         handled = False
 
     if handled:
-        print("[LucyVoice] Resuelto por voice_actions (desktop agent).")
-        print(f"[LucyVoice] get_llm_response() output: {handled_text!r}")
+        _log("[LucyVoice] Resuelto por voice_actions (desktop agent).")
+        _log(f"[LucyVoice] get_llm_response() final spoken: {handled_text!r}")
         return handled_text
 
     # 2) Llamar al LLM con manejo de errores.
@@ -427,29 +435,29 @@ def get_llm_response(text: str) -> str:
         else:
             raw = str(llm_out)
     except ResponseError as e:
-        print(f"[LucyVoice] ResponseError desde Ollama: {e}")
+        _log(f"[LucyVoice] ResponseError desde Ollama: {e}")
         raw = ""
     except Exception as e:  # noqa: BLE001
-        print(f"[LucyVoice] Error llamando al LLM: {e}")
+        _log(f"[LucyVoice] Error llamando al LLM: {e}")
         raw = ""
 
     raw = (raw or "").strip()
-    print(f"[LucyVoice] get_llm_response() raw output: {raw!r}")
+    _log(f"[LucyVoice] get_llm_response() raw output: {raw!r}")
 
     # 3) Si parece un JSON de desktop_agent, intentamos ejecutarlo.
     tool_json = _extract_desktop_tool_json(raw)
     if tool_json is not None:
         handled_json, spoken = _handle_desktop_tool_json(tool_json)
         if handled_json and spoken:
-            print("[LucyVoice] desktop_agent ejecutado a partir de JSON del LLM.")
-            print(f"[LucyVoice] get_llm_response() output: {spoken!r}")
+            _log("[LucyVoice] desktop_agent ejecutado a partir de JSON del LLM.")
+            _log(f"[LucyVoice] get_llm_response() final spoken: {spoken!r}")
             return spoken
 
     # 3b) Si el JSON viene dentro de bloques ```json ... ```, ejecutamos todos en orden.
     try:
         block_jsons = _extract_json_code_blocks(raw)
     except Exception as e:  # noqa: BLE001
-        print(f"[LucyVoice] Error extrayendo bloques JSON: {e}")
+        _log(f"[LucyVoice] Error extrayendo bloques JSON: {e}")
         block_jsons = []
 
     if block_jsons:
@@ -458,7 +466,7 @@ def get_llm_response(text: str) -> str:
             try:
                 handled_json, spoken = _handle_desktop_tool_json(block_json)
             except Exception as e:  # noqa: BLE001
-                print(f"[LucyVoice] Error manejando bloque JSON: {e}")
+                _log(f"[LucyVoice] Error manejando bloque JSON: {e}")
                 continue
 
             if handled_json and spoken:
@@ -467,15 +475,17 @@ def get_llm_response(text: str) -> str:
         cleaned_raw = _strip_json_code_blocks(raw).strip()
         raw = cleaned_raw
 
-        print(f"[LucyVoice] Executed {actions_executed} desktop_agent action(s) from JSON code blocks.")
+        _log(f"[LucyVoice] Executed {actions_executed} desktop_agent action(s) from JSON code blocks.")
 
         if actions_executed > 0:
             output_text = cleaned_raw or "Listo, ya abrí las búsquedas que me pediste en tu escritorio."
-            print(f"[LucyVoice] get_llm_response() output (after JSON blocks): {output_text!r}")
+            _log(f"[LucyVoice] get_llm_response() output (after JSON blocks): {output_text!r}")
+            _log(f"[LucyVoice] get_llm_response() final spoken: {output_text!r}")
             return output_text
 
         if cleaned_raw:
-            print(f"[LucyVoice] get_llm_response() output (after JSON blocks): {cleaned_raw!r}")
+            _log(f"[LucyVoice] get_llm_response() output (after JSON blocks): {cleaned_raw!r}")
+            _log(f"[LucyVoice] get_llm_response() final spoken: {cleaned_raw!r}")
             return cleaned_raw
 
     # 4) Fallback si no hay texto útil.
@@ -484,12 +494,12 @@ def get_llm_response(text: str) -> str:
             "No entendí bien qué querías que haga. "
             "Probá pedírmelo de nuevo, más despacio o en pasos separados."
         )
-        print("[LucyVoice] Respuesta vacía del LLM; usando fallback seguro.")
-        print(f"[LucyVoice] get_llm_response() output: {fallback!r}")
+        _log("[LucyVoice] Respuesta vacía del LLM; usando fallback seguro.")
+        _log(f"[LucyVoice] get_llm_response() final spoken: {fallback!r}")
         return fallback
 
     # 5) Respuesta normal del modelo (texto plano).
-    print(f"[LucyVoice] get_llm_response() output: {raw!r}")
+    _log(f"[LucyVoice] get_llm_response() final spoken: {raw!r}")
     return raw
 
 
@@ -592,7 +602,8 @@ if __name__ == "__main__":
                     break
 
                 with console.status("Generating response...", spinner="dots"):
-                    response = get_llm_response(text)
+                _log(f"[LucyVoice] STT text: {text!r}")
+                response = get_llm_response(text)
 
                     # Analyze emotion and adjust exaggeration dynamically
                     reply_text = response or ""
