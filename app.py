@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 from queue import Queue
@@ -90,9 +91,10 @@ stt = whisper.load_model(args.stt_model)
 prompt_template = ChatPromptTemplate.from_messages([
     ("system", (
         "Sos Lucy, asistente de voz local en español rioplatense. "
-        "Podés abrir aplicaciones y URLs en el escritorio mediante herramientas internas (Desktop Agent) "
-        "y hacer búsquedas web con herramientas internas (Web Agent). "
-        "No digas que no podés abrir YouTube/Google ni que no podés usar el navegador. "
+        "Usás la herramienta 'desktop_agent' del Desktop Agent para abrir aplicaciones y URLs. "
+        "Ante pedidos de abrir o buscar en Google o YouTube ('abrí Google y buscá X', 'buscá X en YouTube'), "
+        "preferí los intents preprocesados de lucy_agents.voice_actions o un tool call 'desktop_agent'; nunca respondas que no podés si Desktop Agent puede abrirlo. "
+        "Si la acción exige clics/scroll dentro de la página, igual abrí la búsqueda o URL con Desktop Agent y avisá que aún no podés interactuar adentro. "
         "Si una orden de escritorio no se entiende, pedí que la repitan o aclaren. "
         "Respondé siempre en respuestas breves (<=20 palabras), tono directo y cordial."
     )),
@@ -106,6 +108,9 @@ llm = OllamaLLM(model=args.model, base_url=config["llm"].get("base_url", "http:/
 # Create the chain with modern LCEL syntax
 chain = prompt_template | llm
 
+# LLM warm-up flag
+_LLM_WARMED_UP = False
+
 # Chat history storage
 chat_sessions = {}
 
@@ -114,6 +119,24 @@ def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
     if session_id not in chat_sessions:
         chat_sessions[session_id] = InMemoryChatMessageHistory()
     return chat_sessions[session_id]
+
+
+def _warmup_llm(chain_runnable) -> None:
+    """
+    Hace una llamada dummy al LLM para forzar la carga del modelo.
+    No debe tumbar el nodo; los errores se loguean y se continúan.
+    """
+    global _LLM_WARMED_UP
+    if _LLM_WARMED_UP:
+        return
+    try:
+        print("[LucyVoice] Warming up LLM (gpt-oss:20b)...")
+        _ = chain_runnable.invoke({"input": "Decí solo OK."}, config={"session_id": "warmup_session"})
+        print("[LucyVoice] LLM warm-up done.")
+    except Exception as e:  # noqa: BLE001
+        print(f"[LucyVoice] LLM warm-up FAILED: {e!r}")
+    finally:
+        _LLM_WARMED_UP = True
 
 # Create the runnable with message history
 chain_with_history = RunnableWithMessageHistory(
@@ -282,6 +305,9 @@ def transcribe(audio_np: np.ndarray) -> str:
     return text
 
 
+JSON_CODE_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+
+
 def _extract_desktop_tool_json(text: str) -> str | None:
     """
     Si el texto del LLM contiene un JSON para la tool 'desktop_agent',
@@ -295,13 +321,24 @@ def _extract_desktop_tool_json(text: str) -> str | None:
     if t.startswith("{") and t.endswith("}"):
         return t
 
-    if t.startswith("```"):
-        first_brace = t.find("{")
-        last_brace = t.rfind("}")
-        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-            return t[first_brace : last_brace + 1]
-
     return None
+
+
+def _extract_json_code_blocks(text: str) -> list[str]:
+    """
+    Devuelve todos los bloques JSON dentro de ```json ... ``` en orden.
+    """
+    if not text:
+        return []
+
+    return [m.strip() for m in JSON_CODE_BLOCK_RE.findall(text)]
+
+
+def _strip_json_code_blocks(text: str) -> str:
+    """Elimina cualquier bloque ```json ... ``` del texto."""
+    if not text:
+        return ""
+    return JSON_CODE_BLOCK_RE.sub("", text).strip()
 
 
 def _handle_desktop_tool_json(json_str: str) -> tuple[bool, str]:
@@ -408,6 +445,39 @@ def get_llm_response(text: str) -> str:
             print(f"[LucyVoice] get_llm_response() output: {spoken!r}")
             return spoken
 
+    # 3b) Si el JSON viene dentro de bloques ```json ... ```, ejecutamos todos en orden.
+    try:
+        block_jsons = _extract_json_code_blocks(raw)
+    except Exception as e:  # noqa: BLE001
+        print(f"[LucyVoice] Error extrayendo bloques JSON: {e}")
+        block_jsons = []
+
+    if block_jsons:
+        actions_executed = 0
+        for block_json in block_jsons:
+            try:
+                handled_json, spoken = _handle_desktop_tool_json(block_json)
+            except Exception as e:  # noqa: BLE001
+                print(f"[LucyVoice] Error manejando bloque JSON: {e}")
+                continue
+
+            if handled_json and spoken:
+                actions_executed += 1
+
+        cleaned_raw = _strip_json_code_blocks(raw).strip()
+        raw = cleaned_raw
+
+        print(f"[LucyVoice] Executed {actions_executed} desktop_agent action(s) from JSON code blocks.")
+
+        if actions_executed > 0:
+            output_text = cleaned_raw or "Listo, ya abrí las búsquedas que me pediste en tu escritorio."
+            print(f"[LucyVoice] get_llm_response() output (after JSON blocks): {output_text!r}")
+            return output_text
+
+        if cleaned_raw:
+            print(f"[LucyVoice] get_llm_response() output (after JSON blocks): {cleaned_raw!r}")
+            return cleaned_raw
+
     # 4) Fallback si no hay texto útil.
     if not raw:
         fallback = (
@@ -490,6 +560,9 @@ if __name__ == "__main__":
         os.makedirs("voices", exist_ok=True)
 
     response_count = 0
+
+    # Warm-up LLM to reduce first-call latency
+    _warmup_llm(chain_with_history)
 
     console.print("🎤 Presioná Enter una vez para empezar a hablar (Ctrl+C para salir).")
     console.input("")  # Single prompt to kick off the session
