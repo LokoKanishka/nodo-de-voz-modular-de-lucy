@@ -592,18 +592,20 @@ if __name__ == "__main__":
                     text = transcribe(audio_np)
 
                 if not text:
+                    _log("[LucyVoice] STT text vacío.")
                     console.print("[red]Silencio detectado. Escuchando nuevamente...[/red]")
                     continue
 
-                console.print(f"[yellow]You: {text}")
+                _log(f"[LucyVoice] STT text: {text!r}")
+                console.print(f"You: {text}")
 
                 if is_sleep_command(text):
                     console.print("[cyan][Lucy] Recibí la orden 'lucy dormi'. Me voy a dormir y cierro la sesión.[/cyan]")
                     break
 
                 with console.status("Generating response...", spinner="dots"):
-                _log(f"[LucyVoice] STT text: {text!r}")
-                response = get_llm_response(text)
+                    _log(f"[LucyVoice] STT text: {text!r}")
+                    response = get_llm_response(text)
 
                     # Analyze emotion and adjust exaggeration dynamically
                     reply_text = response or ""
@@ -623,7 +625,8 @@ if __name__ == "__main__":
                         cfg_weight=dynamic_cfg
                     )
 
-                console.print(f"[cyan]Assistant: {reply_text}")
+                _log(f"[LucyVoice] Assistant spoken: {reply_text!r}")
+                console.print(f"Assistant: {reply_text}")
                 console.print(f"[dim](Emotion: {dynamic_exaggeration:.2f}, CFG: {dynamic_cfg:.2f})[/dim]")
 
                 # Save voice sample if requested
