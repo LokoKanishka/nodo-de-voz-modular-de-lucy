@@ -1,7 +1,12 @@
 import argparse
 import os
+import sys
 import threading
 from queue import Queue
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import numpy as np
 import sounddevice as sd
@@ -16,6 +21,7 @@ from langchain_ollama import OllamaLLM
 from rich.console import Console
 
 from tts import TextToSpeechService
+from lucy_agents.voice_actions import maybe_handle_desktop_intent
 
 console = Console()
 SAMPLE_RATE = 16000  # Hz, used for both VAD and Whisper
@@ -79,7 +85,14 @@ stt = whisper.load_model(args.stt_model)
 
 # Modern prompt template using ChatPromptTemplate
 prompt_template = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful and friendly AI assistant. You are polite, respectful, and aim to provide concise responses of less than 20 words."),
+    ("system", (
+        "Sos Lucy, asistente de voz local en español rioplatense. "
+        "Podés abrir aplicaciones y URLs en el escritorio mediante herramientas internas (Desktop Agent) "
+        "y hacer búsquedas web con herramientas internas (Web Agent). "
+        "No digas que no podés abrir YouTube/Google ni que no podés usar el navegador. "
+        "Si una orden de escritorio no se entiende, pedí que la repitan o aclaren. "
+        "Respondé siempre en respuestas breves (<=20 palabras), tono directo y cordial."
+    )),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}")
 ])
@@ -276,6 +289,10 @@ def get_llm_response(text: str) -> str:
     Returns:
         str: The generated response.
     """
+    if maybe_handle_desktop_intent(text):
+        # Desktop Agent handled it; keep TTS response short.
+        return "Listo, ya lo abrí en tu escritorio."
+
     # Use a default session ID for this simple voice assistant
     session_id = "voice_assistant_session"
 
@@ -389,26 +406,31 @@ if __name__ == "__main__":
                     response = get_llm_response(text)
 
                     # Analyze emotion and adjust exaggeration dynamically
-                    dynamic_exaggeration = analyze_emotion(response)
+                    reply_text = response or ""
+                    if not reply_text.strip():
+                        print("[LucyVoice] Respuesta vacía del LLM / agencia, usando fallback de aclaración.")
+                        reply_text = "No entendí bien lo que querías que haga, ¿podés repetirlo?"
+
+                    dynamic_exaggeration = analyze_emotion(reply_text)
 
                     # Use lower cfg_weight for more expressive responses
                     dynamic_cfg = args.cfg_weight * 0.8 if dynamic_exaggeration > 0.6 else args.cfg_weight
 
                     sample_rate, audio_array = tts.long_form_synthesize(
-                        response,
+                        reply_text,
                         audio_prompt_path=args.voice,
                         exaggeration=dynamic_exaggeration,
                         cfg_weight=dynamic_cfg
                     )
 
-                console.print(f"[cyan]Assistant: {response}")
+                console.print(f"[cyan]Assistant: {reply_text}")
                 console.print(f"[dim](Emotion: {dynamic_exaggeration:.2f}, CFG: {dynamic_cfg:.2f})[/dim]")
 
                 # Save voice sample if requested
                 if args.save_voice:
                     response_count += 1
                     filename = f"voices/response_{response_count:03d}.wav"
-                    tts.save_voice_sample(response, filename, args.voice)
+                    tts.save_voice_sample(reply_text, filename, args.voice)
                     console.print(f"[dim]Voice saved to: {filename}[/dim]")
 
                 play_audio(sample_rate, audio_array)
