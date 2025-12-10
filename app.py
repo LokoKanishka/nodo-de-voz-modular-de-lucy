@@ -27,6 +27,7 @@ from rich.console import Console
 from tts import TextToSpeechService
 from lucy_agents.desktop_bridge import run_desktop_command
 from lucy_agents.voice_actions import maybe_handle_desktop_intent
+from lucy_web_agent import find_youtube_video_url
 
 console = Console()
 SAMPLE_RATE = 16000  # Hz, used for both VAD and Whisper
@@ -92,17 +93,36 @@ tts = TextToSpeechService(voice=args.voice, sample_rate=args.sample_rate)
 # Spanish-first model; language enforced during transcribe to keep STT stable.
 stt = whisper.load_model(args.stt_model)
 
+LUCY_SYSTEM_PROMPT = """Sos Lucy, asistente de voz local en castellano rioplatense.
+Corrés en la PC de Diego, offline, con acceso limitado a herramientas locales.
+No controlás directo el navegador ni el escritorio: siempre usás las capas existentes.
+
+Antes de llamarte, se evalúa lucy_agents.voice_actions para pedidos simples de escritorio
+(por ejemplo, abrir Google o YouTube con una búsqueda). Si eso alcanza, ya se ejecuta
+sin que vos intervengas.
+
+Tu foco cuando intervenís:
+- Responder de forma clara, cercana y respetuosa.
+- Si necesitás usar herramientas, devolvé un JSON con las claves "name" y "arguments".
+  * "name" puede ser "desktop_agent" o "web_agent".
+  * Para desktop_agent: usá "arguments" con "command" (por ejemplo xdg-open + URL) o con "action":"close_window" y "window_title" con el título a cerrar.
+  * Para web_agent: "arguments" incluye "kind":"youtube_latest", "query" breve y opcional "channel_hint".
+- Para web_agent con kind="youtube_latest":
+  * Resumí la frase del usuario a un query corto (3 a 8 palabras) solo con nombres propios y palabras clave como entrevista, programa, charla.
+  * Ignorá frases de relleno y verbos tipo "quiero que", "buscá", "en YouTube", "dale play".
+  * No copies toda la oración: ejemplo correcto → query: "Alejandro Dolina Luis Novaresio entrevista".
+  * Si mencionan canal o programa, ponelo en channel_hint en forma corta (solo el nombre); no lo concatentes dentro del query.
+  * Para pedidos de YouTube devolvé tool-call con name="web_agent", kind="youtube_latest", query breve y limpio, y channel_hint opcional solo con el nombre del canal.
+- Si la acción requiere clicks/scroll dentro de una página, abrí igual la URL con desktop_agent
+  y explicá que no podés interactuar adentro.
+- No prometas acciones que no tengas herramienta para hacer.
+- Si una herramienta falla, contalo en lenguaje natural.
+
+Respondé breve (<=20 palabras) y cordial."""
+
 # Modern prompt template using ChatPromptTemplate
 prompt_template = ChatPromptTemplate.from_messages([
-    ("system", (
-        "Sos Lucy, asistente de voz local en español rioplatense. "
-        "Usás la herramienta 'desktop_agent' del Desktop Agent para abrir aplicaciones y URLs. "
-        "Ante pedidos de abrir o buscar en Google o YouTube ('abrí Google y buscá X', 'buscá X en YouTube'), "
-        "preferí los intents preprocesados de lucy_agents.voice_actions o un tool call 'desktop_agent'; nunca respondas que no podés si Desktop Agent puede abrirlo. "
-        "Si la acción exige clics/scroll dentro de la página, igual abrí la búsqueda o URL con Desktop Agent y avisá que aún no podés interactuar adentro. "
-        "Si una orden de escritorio no se entiende, pedí que la repitan o aclaren. "
-        "Respondé siempre en respuestas breves (<=20 palabras), tono directo y cordial."
-    )),
+    ("system", LUCY_SYSTEM_PROMPT),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}")
 ])
@@ -313,9 +333,9 @@ def transcribe(audio_np: np.ndarray) -> str:
 JSON_CODE_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 
 
-def _extract_desktop_tool_json(text: str) -> str | None:
+def _extract_tool_json(text: str) -> str | None:
     """
-    Si el texto del LLM contiene un JSON para la tool 'desktop_agent',
+    Si el texto del LLM contiene únicamente un JSON (tool-call),
     devuelve el bloque JSON como string. Si no, devuelve None.
     """
     if not text:
@@ -346,61 +366,119 @@ def _strip_json_code_blocks(text: str) -> str:
     return JSON_CODE_BLOCK_RE.sub("", text).strip()
 
 
-def _handle_desktop_tool_json(json_str: str) -> None:
-    """
-    Maneja tool-calls del tipo desktop_agent a partir de un JSON que puede venir en distintos formatos:
-    - {"name": "desktop_agent", "arguments": {"command": "xdg-open ..."}}
-    - {"name": "desktop_agent", "arguments": {"url": "https://..."}}
-    - {"name": "desktop_agent", "arguments": {"action": "close_window", "window_title": "YouTube"}}
-    """
+def _parse_tool_json(json_str: str) -> tuple[Optional[str], dict[str, Any]]:
+    """Devuelve (name, args) o (None, {}) si falla el parseo."""
     try:
         data = json.loads(json_str)
     except Exception as exc:  # noqa: BLE001
-        _log(f"Error parseando JSON de desktop_agent: {exc!r} - raw={json_str!r}")
-        return
+        _log(f"[LucyVoice] Error parseando JSON de tool-call: {exc!r} - raw={json_str!r}")
+        return None, {}
 
-    # Aceptar tanto {"name": ..., "arguments": {...}} como directamente {"command": ...}
-    args: dict[str, Any] = {}
-    name: Optional[str] = None
+    if not isinstance(data, dict):
+        _log(f"[LucyVoice] Tool-call JSON no es dict: {data!r}")
+        return None, {}
 
-    if isinstance(data, dict):
-        name = data.get("name")
-        if "arguments" in data and isinstance(data["arguments"], dict):
-            args = data["arguments"]
-        else:
-            # Caso en que el JSON ya es directamente el payload de argumentos
-            args = data
+    name = data.get("name")
+    args = data.get("arguments") if isinstance(data.get("arguments"), dict) else data
 
-    if name and name != "desktop_agent":
-        _log(f"Ignorando tool no desktop_agent: {name!r}")
-        return
+    if not isinstance(args, dict):
+        _log(f"[LucyVoice] Argumentos de tool-call no son dict: {args!r}")
+        return name, {}
 
+    if not name:
+        if any(k in args for k in ("command", "url", "action")):
+            name = "desktop_agent"
+        elif "kind" in args:
+            name = "web_agent"
+
+    return name, args
+
+
+def _handle_desktop_tool(args: dict[str, Any]) -> tuple[bool, str | None]:
     command = args.get("command")
 
-    # Caso URL suelta → open_url con xdg-open
     url = args.get("url")
-    if not command and url:
-        if isinstance(url, str) and url.startswith(("http://", "https://")):
-            command = f"xdg-open {url}"
-            _log(f"desktop_agent: URL detectada, usando comando: {command!r}")
-        else:
-            _log(f"URL inválida en desktop_agent: {url!r}")
-            return
+    if not command and isinstance(url, str) and url.startswith(("http://", "https://")):
+        command = f"xdg-open {url}"
+        _log(f"[LucyVoice] desktop_agent URL detectada -> comando: {command!r}")
+    elif url and not command:
+        _log(f"[LucyVoice] URL inválida en desktop_agent: {url!r}")
+        return True, "No pude abrir esa URL; verificá el formato."
 
-    # Caso action=close_window con wmctrl -c
     action = args.get("action")
     if not command and action == "close_window":
-        title = (args.get("window_title") or "").strip() or "YouTube"
-        safe_title = title.replace('"', "")[:100]
-        command = f'wmctrl -c "{safe_title}"'
-        _log(f"desktop_agent: close_window para título: {safe_title!r} -> {command!r}")
+        window_title = args.get("window_title")
+        if isinstance(window_title, str):
+            safe_title = window_title.strip().replace('"', "")
+            if safe_title:
+                command = f'wmctrl -c "{safe_title[:120]}"'
+                _log(f"[LucyVoice] desktop_agent close_window → {command}")
+            else:
+                _log("[LucyVoice] close_window sin window_title válido.")
+                return True, "Decime qué ventana querés cerrar."
+        else:
+            _log("[LucyVoice] close_window sin window_title string.")
+            return True, "Decime qué ventana querés cerrar."
 
-    if not command:
-        _log(f"Comando desktop_agent no soportado: {args!r}")
-        return
+    if not isinstance(command, str) or not command.strip():
+        _log(f"[LucyVoice] Comando desktop_agent no soportado: {args!r}")
+        return False, None
 
+    _log(f"[LucyVoice] desktop_agent command: {command!r}")
     exit_code = run_desktop_command(command)
-    _log(f"desktop_agent ejecutado: {command!r} -> exit_code={exit_code}")
+    _log(f"[LucyVoice] desktop_agent exit code: {exit_code}")
+
+    if action == "close_window":
+        spoken = "Cerré la ventana que pediste." if exit_code == 0 else "No pude cerrar la ventana; probá con el título exacto."
+        return True, spoken
+
+    spoken = "Listo, ya lo abrí en tu escritorio." if exit_code == 0 else "Intenté abrirlo, pero falló el comando en el escritorio."
+    return True, spoken
+
+
+def _handle_web_agent_tool(args: dict[str, Any]) -> tuple[bool, str | None]:
+    kind = args.get("kind")
+    if kind == "youtube_latest":
+        query = args.get("query")
+        channel_hint = args.get("channel_hint") if isinstance(args.get("channel_hint"), str) else None
+        strategy = args.get("strategy") if isinstance(args.get("strategy"), str) else "latest"
+
+        if not isinstance(query, str) or not query.strip():
+            _log("[LucyVoice] web_agent youtube_latest sin query válida.")
+            return True, "Necesito el nombre o búsqueda exacta para YouTube."
+
+        _log(f"[LucyVoice] web_agent youtube_latest query={query!r} channel_hint={channel_hint!r} strategy={strategy!r}")
+        url = find_youtube_video_url(query.strip(), channel_hint=channel_hint, strategy=strategy)
+        if not url:
+            _log("[LucyWebAgent] No se encontró URL de video.")
+            return True, "No pude encontrar el video, probá con el nombre completo o revisá la conexión."
+
+        _log(f"[LucyWebAgent] URL encontrada: {url}")
+        exit_code = run_desktop_command(f"xdg-open {url}")
+        _log(f"[LucyVoice] desktop_agent (via web_agent) exit code: {exit_code}")
+
+        if exit_code == 0:
+            return True, "Abrí el video en tu navegador."
+        return True, "Encontré el video pero no pude abrirlo; probá de nuevo."
+
+    _log(f"[LucyVoice] web_agent kind no soportado: {kind!r}")
+    return False, None
+
+
+def _handle_tool_json(json_str: str, source: str = "inline") -> tuple[bool, str | None]:
+    _log(f"[LucyVoice] Detecté tool-call JSON ({source}).")
+    name, args = _parse_tool_json(json_str)
+    if not name or not args:
+        _log(f"[LucyVoice] Tool-call sin nombre/args utilizables: name={name!r} args={args!r}")
+        return False, None
+
+    if name == "desktop_agent":
+        return _handle_desktop_tool(args)
+    if name == "web_agent":
+        return _handle_web_agent_tool(args)
+
+    _log(f"[LucyVoice] Tool no soportada: {name!r}")
+    return False, None
 
 
 def get_llm_response(text: str) -> str:
@@ -410,8 +488,8 @@ def get_llm_response(text: str) -> str:
     Orden de trabajo:
       1) Intentar resolver con voice_actions (reglas + Desktop Agent).
       2) Si no, llamar al LLM (chain_with_history).
-      3) Si el LLM devuelve un JSON de tool 'desktop_agent', ejecutarlo
-         vía Lucy Desktop Agent y devolver un resumen amigable.
+      3) Si el LLM devuelve un JSON de tool-call (desktop_agent / web_agent), procesarlo
+         y devolver un resumen amigable.
       4) Si el LLM falla o devuelve vacío, usar un fallback seguro.
     """
     _log(f"[LucyVoice] get_llm_response() input: {text!r}")
@@ -455,14 +533,19 @@ def get_llm_response(text: str) -> str:
     raw = (raw or "").strip()
     _log(f"[LucyVoice] get_llm_response() raw output: {raw!r}")
 
-    # 3) Si parece un JSON de desktop_agent, intentamos ejecutarlo.
-    tool_json = _extract_desktop_tool_json(raw)
+    # 3) Si parece un JSON de tool-call, intentamos ejecutarlo.
+    tool_json = _extract_tool_json(raw)
     if tool_json is not None:
-        _handle_desktop_tool_json(tool_json)
-        output_text = "Listo, ya lo abrí en tu escritorio."
-        _log("[LucyVoice] desktop_agent ejecutado a partir de JSON del LLM.")
-        _log(f"[LucyVoice] get_llm_response() final spoken: {output_text!r}")
-        return output_text
+        handled, spoken = _handle_tool_json(tool_json, source="top-level")
+        if handled:
+            output_text = spoken or "Listo, ya lo abrí en tu escritorio."
+            _log("[LucyVoice] Tool-call ejecutado a partir de JSON del LLM.")
+            _log(f"[LucyVoice] get_llm_response() final spoken: {output_text!r}")
+            return output_text
+        fallback = "No pude ejecutar esa acción; probá pedírmelo de otra forma."
+        _log("[LucyVoice] Tool-call detectado pero no ejecutado; respondo en texto.")
+        _log(f"[LucyVoice] get_llm_response() final spoken: {fallback!r}")
+        return fallback
 
     # 3b) Si el JSON viene dentro de bloques ```json ... ```, ejecutamos todos en orden.
     try:
@@ -472,11 +555,16 @@ def get_llm_response(text: str) -> str:
         block_jsons = []
 
     if block_jsons:
-        actions_executed = 0
+        _log(f"[LucyVoice] Detecté {len(block_jsons)} bloque(s) JSON para tool-calls.")
+        actions_handled = 0
+        last_spoken: str | None = None
         for block_json in block_jsons:
             try:
-                _handle_desktop_tool_json(block_json)
-                actions_executed += 1
+                handled, spoken = _handle_tool_json(block_json, source="json_block")
+                if handled:
+                    actions_handled += 1
+                    if spoken:
+                        last_spoken = spoken
             except Exception as e:  # noqa: BLE001
                 _log(f"[LucyVoice] Error manejando bloque JSON: {e}")
                 continue
@@ -484,10 +572,10 @@ def get_llm_response(text: str) -> str:
         cleaned_raw = _strip_json_code_blocks(raw).strip()
         raw = cleaned_raw
 
-        _log(f"[LucyVoice] Executed {actions_executed} desktop_agent action(s) from JSON code blocks.")
+        _log(f"[LucyVoice] Handled {actions_handled} tool-call action(s) from JSON code blocks.")
 
-        if actions_executed > 0:
-            output_text = cleaned_raw or "Listo, ya abrí las búsquedas que me pediste en tu escritorio."
+        if actions_handled > 0:
+            output_text = last_spoken or cleaned_raw or "Listo, ya abrí las búsquedas que me pediste en tu escritorio."
             _log(f"[LucyVoice] get_llm_response() output (after JSON blocks): {output_text!r}")
             _log(f"[LucyVoice] get_llm_response() final spoken: {output_text!r}")
             return output_text
@@ -508,6 +596,7 @@ def get_llm_response(text: str) -> str:
         return fallback
 
     # 5) Respuesta normal del modelo (texto plano).
+    _log("[LucyVoice] Sin tool-calls; respondo en texto plano.")
     _log(f"[LucyVoice] get_llm_response() final spoken: {raw!r}")
     return raw
 
