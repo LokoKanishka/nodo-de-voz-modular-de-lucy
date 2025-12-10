@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 from queue import Queue
+from typing import Any, Optional
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
@@ -345,51 +346,61 @@ def _strip_json_code_blocks(text: str) -> str:
     return JSON_CODE_BLOCK_RE.sub("", text).strip()
 
 
-def _handle_desktop_tool_json(json_str: str) -> tuple[bool, str]:
+def _handle_desktop_tool_json(json_str: str) -> None:
     """
-    Intenta interpretar un JSON de tool 'desktop_agent' y ejecutar la acción
-    vía Lucy Desktop Agent. Devuelve (handled, texto_para_el_usuario).
+    Maneja tool-calls del tipo desktop_agent a partir de un JSON que puede venir en distintos formatos:
+    - {"name": "desktop_agent", "arguments": {"command": "xdg-open ..."}}
+    - {"name": "desktop_agent", "arguments": {"url": "https://..."}}
+    - {"name": "desktop_agent", "arguments": {"action": "close_window", "window_title": "YouTube"}}
     """
     try:
         data = json.loads(json_str)
-    except Exception as e:  # noqa: BLE001
-        _log(f"[LucyVoice] No pude parsear JSON de tool: {e}: {json_str!r}")
-        return False, ""
+    except Exception as exc:  # noqa: BLE001
+        _log(f"Error parseando JSON de desktop_agent: {exc!r} - raw={json_str!r}")
+        return
 
-    if not isinstance(data, dict):
-        return False, ""
+    # Aceptar tanto {"name": ..., "arguments": {...}} como directamente {"command": ...}
+    args: dict[str, Any] = {}
+    name: Optional[str] = None
 
-    if data.get("name") != "desktop_agent":
-        return False, ""
-
-    args = data.get("arguments") or {}
-    command = args.get("command")
-    url = args.get("url")
-
-    # Si falta "command" pero hay URL, asumimos open_url (el modelo a veces omite el campo).
-    if isinstance(url, str) and not command:
-        command = "open_url"
-
-    if command == "open_url" and isinstance(url, str):
-        if not (url.startswith("http://") or url.startswith("https://")):
-            _log(f"[LucyVoice] URL de desktop_agent no segura: {url!r}")
-            return False, ""
-
-        desktop_cmd = f"xdg-open {url}"
-        _log(f"[LucyVoice] Executing desktop_agent.open_url -> {desktop_cmd!r}")
-        exit_code = run_desktop_command(desktop_cmd)
-        _log(f"[LucyVoice] desktop_agent.open_url exit_code: {exit_code}")
-
-        if exit_code == 0:
-            return True, "Listo, ya lo abrí en tu escritorio."
+    if isinstance(data, dict):
+        name = data.get("name")
+        if "arguments" in data and isinstance(data["arguments"], dict):
+            args = data["arguments"]
         else:
-            return True, (
-                "Intenté abrirlo pero algo falló en el escritorio. "
-                "Revisá si el navegador está instalado y funcionando."
-            )
+            # Caso en que el JSON ya es directamente el payload de argumentos
+            args = data
 
-    _log(f"[LucyVoice] Comando desktop_agent no soportado: {command!r}")
-    return False, ""
+    if name and name != "desktop_agent":
+        _log(f"Ignorando tool no desktop_agent: {name!r}")
+        return
+
+    command = args.get("command")
+
+    # Caso URL suelta → open_url con xdg-open
+    url = args.get("url")
+    if not command and url:
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            command = f"xdg-open {url}"
+            _log(f"desktop_agent: URL detectada, usando comando: {command!r}")
+        else:
+            _log(f"URL inválida en desktop_agent: {url!r}")
+            return
+
+    # Caso action=close_window con wmctrl -c
+    action = args.get("action")
+    if not command and action == "close_window":
+        title = (args.get("window_title") or "").strip() or "YouTube"
+        safe_title = title.replace('"', "")[:100]
+        command = f'wmctrl -c "{safe_title}"'
+        _log(f"desktop_agent: close_window para título: {safe_title!r} -> {command!r}")
+
+    if not command:
+        _log(f"Comando desktop_agent no soportado: {args!r}")
+        return
+
+    exit_code = run_desktop_command(command)
+    _log(f"desktop_agent ejecutado: {command!r} -> exit_code={exit_code}")
 
 
 def get_llm_response(text: str) -> str:
@@ -447,11 +458,11 @@ def get_llm_response(text: str) -> str:
     # 3) Si parece un JSON de desktop_agent, intentamos ejecutarlo.
     tool_json = _extract_desktop_tool_json(raw)
     if tool_json is not None:
-        handled_json, spoken = _handle_desktop_tool_json(tool_json)
-        if handled_json and spoken:
-            _log("[LucyVoice] desktop_agent ejecutado a partir de JSON del LLM.")
-            _log(f"[LucyVoice] get_llm_response() final spoken: {spoken!r}")
-            return spoken
+        _handle_desktop_tool_json(tool_json)
+        output_text = "Listo, ya lo abrí en tu escritorio."
+        _log("[LucyVoice] desktop_agent ejecutado a partir de JSON del LLM.")
+        _log(f"[LucyVoice] get_llm_response() final spoken: {output_text!r}")
+        return output_text
 
     # 3b) Si el JSON viene dentro de bloques ```json ... ```, ejecutamos todos en orden.
     try:
@@ -464,13 +475,11 @@ def get_llm_response(text: str) -> str:
         actions_executed = 0
         for block_json in block_jsons:
             try:
-                handled_json, spoken = _handle_desktop_tool_json(block_json)
+                _handle_desktop_tool_json(block_json)
+                actions_executed += 1
             except Exception as e:  # noqa: BLE001
                 _log(f"[LucyVoice] Error manejando bloque JSON: {e}")
                 continue
-
-            if handled_json and spoken:
-                actions_executed += 1
 
         cleaned_raw = _strip_json_code_blocks(raw).strip()
         raw = cleaned_raw
