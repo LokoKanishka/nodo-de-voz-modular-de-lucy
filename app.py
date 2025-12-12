@@ -39,7 +39,7 @@ def _log(msg: str) -> None:
 DEFAULT_CONFIG = {
     "tts": {
         "engine": "mimic3",
-        "voice": "es_ES/m-ailabs_low",
+        "voice": "es_ES/m-ailabs_low#karen_savage",
         "sample_rate": 16000,
     },
     "stt": {
@@ -76,7 +76,12 @@ config = load_config()
 
 # Parse command line arguments using config defaults
 parser = argparse.ArgumentParser(description="Local Voice Assistant with Mimic3 TTS (Lucy-style)")
-parser.add_argument("--voice", type=str, default=config["tts"]["voice"], help="Mimic3 voice id (e.g., es_ES/m-ailabs_low)")
+parser.add_argument(
+    "--voice",
+    type=str,
+    default=config["tts"]["voice"],
+    help="Mimic3 voice id (e.g., es_ES/m-ailabs_low#karen_savage)",
+)
 parser.add_argument("--sample-rate", type=int, default=config["tts"]["sample_rate"], help="Output sample rate for TTS/audio playback")
 parser.add_argument("--exaggeration", type=float, default=0.5, help="Emotion exaggeration (0.0-1.0)")
 parser.add_argument("--cfg-weight", type=float, default=0.5, help="CFG weight for pacing (0.0-1.0)")
@@ -107,6 +112,19 @@ Tu foco cuando intervenís:
   * "name" puede ser "desktop_agent" o "web_agent".
   * Para desktop_agent: usá "arguments" con "command" (por ejemplo xdg-open + URL) o con "action":"close_window" y "window_title" con el título a cerrar.
   * Para web_agent: "arguments" incluye "kind":"youtube_latest", "query" breve y opcional "channel_hint".
+- Herramientas disponibles (tools):
+  1) desktop_agent:
+     - Uso: acciones directas en el escritorio.
+     - Ejemplos:
+       - Abrir una URL en el navegador: name=desktop_agent, arguments con action=open_url y url con la dirección completa.
+       - Cerrar una ventana: name=desktop_agent, arguments con action=close_window y window_title con el título de la ventana (ej. "YouTube").
+  2) web_agent:
+     - Uso: encontrar un video en YouTube a partir de una descripción.
+     - Soporta: kind="youtube_latest", query="<búsqueda breve>", channel_hint="<canal/persona opcional>".
+     - No habla con el usuario: devuelve una URL para que desktop_agent la abra.
+     - Ejemplo de pedido y tool-call esperado:
+       Usuario: "Buscá una entrevista en YouTube de Alejandro Dolina con Luis Navarro y reproducila."
+       Tool-call: name=web_agent, arguments con kind=youtube_latest, query="Alejandro Dolina Luis Navarro entrevista", channel_hint="Alejandro Dolina".
 - Para web_agent con kind="youtube_latest":
   * Resumí la frase del usuario a un query corto (3 a 8 palabras) solo con nombres propios y palabras clave como entrevista, programa, charla.
   * Ignorá frases de relleno y verbos tipo "quiero que", "buscá", "en YouTube", "dale play".
@@ -457,8 +475,14 @@ def _handle_web_agent_tool(args: dict[str, Any]) -> tuple[bool, str | None]:
         exit_code = run_desktop_command(f"xdg-open {url}")
         _log(f"[LucyVoice] desktop_agent (via web_agent) exit code: {exit_code}")
 
+        is_search = isinstance(url, str) and url.startswith("https://www.youtube.com/results?search_query=")
         if exit_code == 0:
-            return True, "Abrí el video en tu navegador."
+            spoken = (
+                "Abrí el video en tu navegador."
+                if not is_search
+                else "No encontré una entrevista exacta, pero te abrí la búsqueda en YouTube para que elijas."
+            )
+            return True, spoken
         return True, "Encontré el video pero no pude abrirlo; probá de nuevo."
 
     _log(f"[LucyVoice] web_agent kind no soportado: {kind!r}")

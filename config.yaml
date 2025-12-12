@@ -2,7 +2,7 @@
 
 tts:
   engine: mimic3
-  voice: es_ES/m-ailabs_low
+  voice: es_ES/m-ailabs_low#karen_savage
   sample_rate: 16000
 
 stt:

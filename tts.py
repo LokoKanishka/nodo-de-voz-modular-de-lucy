@@ -22,7 +22,7 @@ class TextToSpeechService:
 
     def __init__(
         self,
-        voice: str = "es_ES/m-ailabs_low",
+        voice: str = "es_ES/m-ailabs_low#karen_savage",
         sample_rate: int = 16000,
         device: Optional[str] = None,
     ):
@@ -36,7 +36,7 @@ class TextToSpeechService:
         self.voice = voice
         self.sample_rate = sample_rate
         self._mimic3_sample_rate = 22050  # default mimic3 output
-        print(f"Using Mimic3 TTS with voice: {self.voice} @ {self.sample_rate}Hz")
+        print(f"Using Mimic3 voice: {self.voice} @ {self.sample_rate}Hz")
 
     def synthesize(
         self,
