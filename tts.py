@@ -69,6 +69,14 @@ class TextToSpeechService:
                 check=True,
             )
             wav_bytes = proc.stdout
+
+            # Si mimic3 escribe algo a stderr aun con rc=0, no lo traguemos:
+            stderr_txt = (proc.stderr or b"").decode("utf-8", errors="ignore").strip()
+            if stderr_txt:
+                lines = [ln.strip() for ln in stderr_txt.splitlines() if ln.strip()]
+                non_info = [ln for ln in lines if not ln.startswith("INFO:")]
+                if non_info:
+                    print("[Mimic3] stderr:", " | ".join(non_info[:5]), flush=True)
         except subprocess.CalledProcessError as e:
             print(f"Error calling mimic3: {e} | stderr={e.stderr.decode(errors='ignore')}")
             # Return silence on error
