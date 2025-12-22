@@ -489,6 +489,65 @@ def _handle_web_agent_tool(args: dict[str, Any]) -> tuple[bool, str | None]:
     return False, None
 
 
+
+def _wants_playback_text(text: str) -> bool:
+    low = (text or "").lower()
+    markers = (
+        "reproduc", "play",
+        "poné", "pone", "ponlo", "ponelo", "poneme",
+        "quiero verlo", "quiero ver", "quiero escucharlo", "quiero escuchar",
+        "que se reproduzca", "dale play",
+    )
+    return any(m in low for m in markers)
+
+
+def _is_youtube_search_request(text: str) -> bool:
+    low = (text or "").lower()
+    if ("youtube" not in low) and ("you tube" not in low):
+        return False
+    if not re.search(r"\bbusc", low):
+        return False
+    # si pide playback, no aplicamos guardrail
+    if _wants_playback_text(low):
+        return False
+    return True
+
+
+def _extract_youtube_search_query_from_text(text: str) -> str:
+    """
+    Extracción simple/determinista: sacamos wakeword + verbos + plataforma + coletillas,
+    dejamos el objeto de búsqueda.
+    """
+    low = (text or "").lower()
+
+    # wakeword
+    low = re.sub(r"\blucy\b[:,]?\s*", " ", low)
+
+    # verbos comunes
+    low = re.sub(r"\b(abr[ií]r|abr[ií]|abre|busc[aá]r|busc[aá]|busca|busqu(?:e|es|en)|buscame|bokk?a)\b", " ", low)
+
+    # plataforma
+    low = re.sub(r"\b(en|por)?\s*(youtube|you\s*tube)\b", " ", low)
+    low = re.sub(r"\b(youtube|you\s*tube)\b", " ", low)
+
+    # coletillas típicas
+    low = re.sub(r"\b(y\s+)?contame\b.*$", " ", low)
+    low = re.sub(r"\b(y\s+)?breve(?:mente)?\b.*$", " ", low)
+    low = re.sub(r"\b(y\s+)?resum\w*\b.*$", " ", low)
+
+    # limpieza
+    low = re.sub(r"[\"'`]", " ", low)
+    low = re.sub(r"[^0-9a-záéíóúñü\s]+", " ", low)
+    low = re.sub(r"\s+", " ", low).strip()
+    return low
+
+
+def _youtube_results_url(query: str) -> str:
+    from urllib.parse import quote_plus
+    q = (query or "").strip()
+    return "https://www.youtube.com/results?search_query=" + quote_plus(q)
+
+
 def _handle_tool_json(json_str: str, source: str = "inline") -> tuple[bool, str | None]:
     _log(f"[LucyVoice] Detecté tool-call JSON ({source}).")
     name, args = _parse_tool_json(json_str)
@@ -560,6 +619,23 @@ def get_llm_response(text: str) -> str:
     # 3) Si parece un JSON de tool-call, intentamos ejecutarlo.
     tool_json = _extract_tool_json(raw)
     if tool_json is not None:
+        # Guardrail: si el LLM devuelve youtube_latest pero el usuario pidió BÚSQUEDA (no playback),
+        # abrimos results?search_query=... y evitamos elegir un video incorrecto.
+        try:
+            _name, _args = _parse_tool_json(tool_json)
+        except Exception:
+            _name, _args = None, None
+
+        if _name == "web_agent" and isinstance(_args, dict) and _args.get("kind") == "youtube_latest":
+            if _is_youtube_search_request(text):
+                q = _extract_youtube_search_query_from_text(text) or str(_args.get("query") or "")
+                q = (q or "").strip()
+                if q:
+                    url = _youtube_results_url(q)
+                    _log(f"[LucyVoice] Guardrail: youtube_latest -> open search url={url}")
+                    rc = run_desktop_command(f"xdg-open {url}")
+                    _log(f"[LucyVoice] desktop_agent (guardrail yt search) exit code: {rc}")
+                    return "Te abrí la búsqueda en YouTube." if rc == 0 else "Intenté abrir la búsqueda en YouTube, pero falló el comando."
         handled, spoken = _handle_tool_json(tool_json, source="top-level")
         if handled:
             output_text = spoken or "Listo, ya lo abrí en tu escritorio."
@@ -583,6 +659,22 @@ def get_llm_response(text: str) -> str:
         actions_handled = 0
         last_spoken: str | None = None
         for block_json in block_jsons:
+            try:
+                _name, _args = _parse_tool_json(block_json)
+            except Exception:
+                _name, _args = None, None
+            if _name == "web_agent" and isinstance(_args, dict) and _args.get("kind") == "youtube_latest":
+                if _is_youtube_search_request(text):
+                    q = _extract_youtube_search_query_from_text(text) or str(_args.get("query") or "")
+                    q = (q or "").strip()
+                    if q:
+                        url = _youtube_results_url(q)
+                        _log(f"[LucyVoice] Guardrail: youtube_latest -> open search url={url}")
+                        rc = run_desktop_command(f"xdg-open {url}")
+                        _log(f"[LucyVoice] desktop_agent (guardrail yt search) exit code: {rc}")
+                        actions_handled += 1
+                        last_spoken = "Te abrí la búsqueda en YouTube." if rc == 0 else "Intenté abrir la búsqueda en YouTube, pero falló el comando."
+                        continue
             try:
                 handled, spoken = _handle_tool_json(block_json, source="json_block")
                 if handled:
