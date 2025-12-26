@@ -4,6 +4,8 @@ import os
 import re
 import sys
 import threading
+import concurrent.futures as cf
+
 from queue import Queue
 from typing import Any, Optional
 
@@ -595,18 +597,32 @@ def get_llm_response(text: str) -> str:
         _log("[LucyVoice] Resuelto por voice_actions (desktop agent).")
         _log(f"[LucyVoice] get_llm_response() final spoken: {handled_text!r}")
         return handled_text
-
-    # 2) Llamar al LLM con manejo de errores.
+    # 2) Llamar al LLM con manejo de errores (con timeout para no colgar el loop).
     raw = ""
     try:
         session_id = "voice_assistant_session"
-        llm_out = chain_with_history.invoke({"input": text}, config={"session_id": session_id})
+
+        timeout_s = 25
+        try:
+            timeout_s = int(os.environ.get("LUCY_LLM_TIMEOUT", "25"))
+        except Exception:
+            timeout_s = 25
+
+        # Ejecutar invoke con timeout (Ollama puede tardar/cuelgar en primera carga).
+        with cf.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(lambda: chain_with_history.invoke({"input": text}, config={"session_id": session_id}))
+            llm_out = fut.result(timeout=timeout_s)
+
         if isinstance(llm_out, str):
             raw = llm_out
         elif hasattr(llm_out, "content"):
             raw = str(llm_out.content)
         else:
             raw = str(llm_out)
+
+    except cf.TimeoutError:
+        _log(f"[LucyVoice] LLM timeout ({timeout_s}s).")
+        return "Me estoy demorando en responder. Repetí la frase, o pedime 'chatgpt, ...'."
     except ResponseError as e:
         _log(f"[LucyVoice] ResponseError desde Ollama: {e}")
         raw = ""
@@ -814,7 +830,11 @@ if __name__ == "__main__":
                 if is_sleep_command(text):
                     console.print("[cyan][Lucy] Recibí la orden 'lucy dormi'. Me voy a dormir y cierro la sesión.[/cyan]")
                     break
-                response = get_llm_response(text)
+                try:
+                    response = get_llm_response(text)
+                except KeyboardInterrupt:
+                    console.print("[red]Cancelado.[/red]")
+                    continue
                 reply_text = response or ""
                 if not reply_text.strip():
                     reply_text = "No entendí bien lo que querías que haga, ¿podés repetirlo?"
