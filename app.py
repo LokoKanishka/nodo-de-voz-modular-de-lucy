@@ -90,6 +90,7 @@ parser.add_argument("--save-voice", action="store_true", help="Save generated vo
 parser.add_argument("--stt-model", type=str, default=config["stt"]["model"], help="Whisper model name (Spanish-capable)")
 parser.add_argument("--stt-language", type=str, default=config["stt"]["language"], help="Target language for Whisper")
 parser.add_argument("--stt-task", type=str, default=config["stt"]["task"], help="Whisper task: transcribe/translate")
+parser.add_argument("--text", action="store_true", help="Modo texto: lee líneas por stdin (sin mic/tts)")
 args = parser.parse_args()
 
 # Initialize TTS with Mimic3 (default Spanish voice)
@@ -786,7 +787,35 @@ if __name__ == "__main__":
     response_count = 0
 
     # Warm-up LLM to reduce first-call latency
-    _warmup_llm(chain_with_history)
+    if not args.text:
+        _warmup_llm(chain_with_history)
+
+    if args.text:
+        console.print("[cyan]📝 Modo texto activo (stdin). Escribí una línea y Enter. Ctrl+D para salir.[/cyan]")
+        try:
+            while True:
+                try:
+                    text = console.input("> ")
+                except EOFError:
+                    break
+                text = (text or "").strip()
+                if not text:
+                    continue
+                _log(f"[LucyVoice] TEXT input: {text!r}")
+                console.print(f"You: {text}")
+                if is_sleep_command(text):
+                    console.print("[cyan][Lucy] Recibí la orden 'lucy dormi'. Me voy a dormir y cierro la sesión.[/cyan]")
+                    break
+                response = get_llm_response(text)
+                reply_text = response or ""
+                if not reply_text.strip():
+                    reply_text = "No entendí bien lo que querías que haga, ¿podés repetirlo?"
+                _log(f"[LucyVoice] Assistant (text): {reply_text!r}")
+                console.print(f"Assistant: {reply_text}")
+        except KeyboardInterrupt:
+            console.print("\n[red]Saliendo del asistente (modo texto)...")
+        console.print("[blue]Session ended. Thank you for using ChatterBox Voice Assistant!")
+        raise SystemExit(0)
 
     console.print("🎤 Presioná Enter una vez para empezar a hablar (Ctrl+C para salir).")
     console.input("")  # Single prompt to kick off the session
