@@ -792,6 +792,14 @@ if __name__ == "__main__":
 
     if args.text:
         console.print("[cyan]📝 Modo texto activo (stdin). Escribí una línea y Enter. Ctrl+D para salir.[/cyan]")
+        # Si stdin no es TTY (p.ej. lanzado desde script / servicio), intentamos leer del TTY real.
+        try:
+            _log(f"[LucyVoice] TEXT stdin isatty(before)={sys.stdin.isatty()}")
+            if not sys.stdin.isatty():
+                sys.stdin = open('/dev/tty', 'r', encoding='utf-8', errors='replace')
+            _log(f"[LucyVoice] TEXT stdin isatty(after)={sys.stdin.isatty()}")
+        except Exception as _exc:
+            _log(f"[LucyVoice] TEXT no pude abrir /dev/tty: {_exc!r}")
         try:
             while True:
                 try:
