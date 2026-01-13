@@ -31,6 +31,14 @@ from lucy_agents.desktop_bridge import run_desktop_command
 from lucy_agents.voice_actions import maybe_handle_desktop_intent
 from lucy_web_agent import find_youtube_video_url
 
+# Wake word detection
+try:
+    from lucy_tools.wake_word import build_wakeword_model, WakeWordDetector
+    WAKE_WORD_AVAILABLE = True
+except ImportError:
+    WAKE_WORD_AVAILABLE = False
+    print("[LucyVoice] Warning: Wake word module not available")
+
 console = Console()
 SAMPLE_RATE = 16000  # Hz, used for both VAD and Whisper
 
@@ -111,10 +119,18 @@ sin que vos intervengas.
 
 Tu foco cuando intervenís:
 - Responder de forma clara, cercana y respetuosa.
+- IMPORTANTE: Podés recibir instrucciones con múltiples pasos o acciones encadenadas.
+  Cuando el usuario dice "primero X y luego Y" o "abre X y después Y", tratá cada acción
+  por separado ejecutándolas en orden. Por ejemplo:
+    Usuario: "Abre Firefox y busca videos de gatos"
+    → Primero ejecutás desktop_agent para abrir Firefox
+    → Luego ejecutás web_agent o desktop_agent para la búsqueda
+  
 - Si necesitás usar herramientas, devolvé un JSON con las claves "name" y "arguments".
   * "name" puede ser "desktop_agent" o "web_agent".
   * Para desktop_agent: usá "arguments" con "command" (por ejemplo xdg-open + URL) o con "action":"close_window" y "window_title" con el título a cerrar.
   * Para web_agent: "arguments" incluye "kind":"youtube_latest", "query" breve y opcional "channel_hint".
+  
 - Herramientas disponibles (tools):
   1) desktop_agent:
      - Uso: acciones directas en el escritorio.
@@ -128,12 +144,14 @@ Tu foco cuando intervenís:
      - Ejemplo de pedido y tool-call esperado:
        Usuario: "Buscá una entrevista en YouTube de Alejandro Dolina con Luis Navarro y reproducila."
        Tool-call: name=web_agent, arguments con kind=youtube_latest, query="Alejandro Dolina Luis Navarro entrevista", channel_hint="Alejandro Dolina".
+       
 - Para web_agent con kind="youtube_latest":
   * Resumí la frase del usuario a un query corto (3 a 8 palabras) solo con nombres propios y palabras clave como entrevista, programa, charla.
   * Ignorá frases de relleno y verbos tipo "quiero que", "buscá", "en YouTube", "dale play".
   * No copies toda la oración: ejemplo correcto → query: "Alejandro Dolina Luis Novaresio entrevista".
   * Si mencionan canal o programa, ponelo en channel_hint en forma corta (solo el nombre); no lo concatentes dentro del query.
   * Para pedidos de YouTube devolvé tool-call con name="web_agent", kind="youtube_latest", query breve y limpio, y channel_hint opcional solo con el nombre del canal.
+  
 - Si la acción requiere clicks/scroll dentro de una página, abrí igual la URL con desktop_agent
   y explicá que no podés interactuar adentro.
 - No prometas acciones que no tengas herramienta para hacer.
@@ -805,6 +823,30 @@ if __name__ == "__main__":
     # Warm-up LLM to reduce first-call latency
     if not args.text:
         _warmup_llm(chain_with_history)
+
+    # Initialize wake word detector if enabled
+    wake_detector = None
+    wake_word_enabled = False
+    half_duplex_enabled = config.get("voice_modular", {}).get("half_duplex", True)
+    
+    if WAKE_WORD_AVAILABLE and not args.text:
+        try:
+            wake_detector = build_wakeword_model(config)
+            wake_word_enabled = wake_detector is not None
+            if wake_word_enabled:
+                console.print("[green]✓ Wake word detector initialized[/green]")
+                wake_cfg = config.get("wake_word", {})
+                console.print(f"[dim]  Threshold: {wake_cfg.get('confidence_threshold', 0.5)}[/dim]")
+                if wake_detector.model_paths:
+                    console.print(f"[dim]  Custom models: {len(wake_detector.model_paths)}[/dim]")
+                else:
+                    console.print(f"[dim]  Using default models (hey_jarvis, alexa, etc.)[/dim]")
+        except Exception as exc:
+            console.print(f"[yellow]Warning: Could not initialize wake word: {exc}[/yellow]")
+    
+    # Global flag for half-duplex (mic muting during TTS)
+    _mic_active = threading.Event()
+    _mic_active.set()  # Start with mic active
 
     if args.text:
         console.print("[cyan]📝 Modo texto activo (stdin). Escribí una línea y Enter. Ctrl+D para salir.[/cyan]")
