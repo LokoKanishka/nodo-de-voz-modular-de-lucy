@@ -824,26 +824,30 @@ if __name__ == "__main__":
     if not args.text:
         _warmup_llm(chain_with_history)
 
-    # Initialize wake word detector if enabled
-    wake_detector = None
-    wake_word_enabled = False
     half_duplex_enabled = config.get("voice_modular", {}).get("half_duplex", True)
+    wake_cfg = config.get("wake_word", {})
+    wake_word_enabled = wake_cfg.get("enabled", True)
     
-    if WAKE_WORD_AVAILABLE and not args.text:
+    if wake_word_enabled:
+        if not WAKE_WORD_AVAILABLE:
+            console.print("[red]❌ ERROR CRÍTICO: Wake word habilitado pero falta 'openwakeword'.[/red]")
+            console.print("[red]   Ejecutá: ./scripts/install_wakeword_deps.sh[/red]")
+            # Strict fail as requested in hotfix ticket
+            sys.exit(1)
+            
         try:
             wake_detector = build_wakeword_model(config)
-            wake_word_enabled = wake_detector is not None
-            if wake_word_enabled:
+            if wake_detector:
                 console.print("[green]✓ Wake word detector initialized[/green]")
-                wake_cfg = config.get("wake_word", {})
                 console.print(f"[dim]  Threshold: {wake_cfg.get('confidence_threshold', 0.5)}[/dim]")
                 if wake_detector.model_paths:
                     console.print(f"[dim]  Custom models: {len(wake_detector.model_paths)}[/dim]")
                 else:
                     console.print(f"[dim]  Using default models (hey_jarvis, alexa, etc.)[/dim]")
         except Exception as exc:
-            console.print(f"[yellow]Warning: Could not initialize wake word: {exc}[/yellow]")
-    
+            console.print(f"[red]Error initializing wake word: {exc}[/red]")
+            sys.exit(1)
+            
     # Global flag for half-duplex (mic muting during TTS)
     _mic_active = threading.Event()
     _mic_active.set()  # Start with mic active
